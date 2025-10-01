@@ -1,18 +1,35 @@
 import io
 import re
-import unicodedata
 from typing import List
 
 import streamlit as st
 from docx import Document
 
-st.set_page_config(page_title="DOCX → Prompts TXT", page_icon="📝", layout="wide")
+# langdetect là tùy chọn
+try:
+    from langdetect import detect
+    LANGDETECT_AVAILABLE = True
+except Exception:
+    LANGDETECT_AVAILABLE = False
 
-# ---------- Heuristics ----------
+st.set_page_config(page_title="DOCX → English Prompts TXT", layout="wide")
+
+# ----------------- Tiện ích -----------------
+EN_STOPWORDS_SAMPLE = {
+    "the","and","to","of","a","in","is","that","for","on","with","as","by","from",
+    "this","be","are","at","or","it","an","into","over","under","about","into","can",
+    "scene","character","dialogue","objective","environment","camera","lighting","transition","audio","vfx"
+}
+
+VN_DIACRITIC_REGEX = re.compile(
+    r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡ"
+    r"ùúụủũưừứựửữỳýỵỷỹđÀÁẠẢÃÂẦẤẬẨẪĂẰẮẶẲẴÈÉẸẺẼÊỀẾỆỂỄ"
+    r"ÌÍỊỈĨÒÓỌỎÕÔỒỐỘỔỖƠỜỚỢỞỠÙÚỤỦŨƯỪỨỰỬỮỲÝỴỶỸĐ]"
+)
+
 DEFAULT_KEYWORDS = [
-    "objective", "environment", "characters", "props", "dialogue",
-    "teamwork", "camera", "lighting", "vfx", "audio", "rhythm",
-    "transition", "cta"
+    "objective","environment","characters","props","dialogue",
+    "teamwork","camera","lighting","vfx","audio","rhythm","transition","cta"
 ]
 
 def ascii_ratio(s: str) -> float:
@@ -21,135 +38,115 @@ def ascii_ratio(s: str) -> float:
     return sum(1 for ch in s if ord(ch) < 128) / len(s)
 
 def normalize_ws(s: str) -> str:
-    # Ghép các run trong Word, loại bỏ xuống dòng thừa
-    s = " ".join(s.split())
-    return s.strip()
+    return " ".join((s or "").split()).strip()
 
-def looks_like_prompt(
-    text: str,
-    min_len: int,
-    min_ascii_ratio: float,
-    min_keyword_hits: int,
-    user_keywords: List[str]
-) -> bool:
-    if len(text) < min_len:
+def is_english_heuristic(text: str) -> bool:
+    # 1) Không có dấu tiếng Việt
+    if VN_DIACRITIC_REGEX.search(text):
+        return False
+    # 2) Tỷ lệ ASCII cao
+    if ascii_ratio(text) < 0.85:
+        return False
+    # 3) Chứa nhiều từ chức năng/từ khóa tiếng Anh
+    tokens = re.findall(r"[A-Za-z]+", text.lower())
+    if not tokens:
+        return False
+    hits = sum(1 for t in tokens if t in EN_STOPWORDS_SAMPLE)
+    return hits >= 8  # ngưỡng tương đối chặt
+
+def is_english_langdetect(text: str) -> bool:
+    if not LANGDETECT_AVAILABLE:
+        return False
+    try:
+        return detect(text) == "en"
+    except Exception:
         return False
 
-    # Tỷ lệ ASCII (nhiều prompt tiếng Anh dài)
-    if ascii_ratio(text) < min_ascii_ratio:
-        return False
-
-    # Đếm keyword
-    keys = [k.strip().lower() for k in user_keywords if k.strip()]
-    hits = sum(1 for k in keys if k in text.lower())
-    if hits < min_keyword_hits:
-        return False
-
-    # Prompt thường là 1 block dài, ít dấu câu tương ứng số câu hạn chế
-    # (nhưng vẫn linh hoạt để không bỏ sót)
-    # Có thể tùy biến nếu cần:
-    return True
+def is_english(text: str, strict: bool) -> bool:
+    if strict and LANGDETECT_AVAILABLE:
+        return is_english_langdetect(text)
+    # fallback: heuristic nhanh
+    return is_english_heuristic(text)
 
 def extract_paragraphs_from_docx(file_bytes: bytes) -> List[str]:
     doc = Document(io.BytesIO(file_bytes))
     paras = []
     for p in doc.paragraphs:
-        t = normalize_ws(p.text or "")
+        t = normalize_ws(p.text)
         if t:
             paras.append(t)
     return paras
 
-def filter_prompts(
-    paragraphs: List[str],
-    min_len: int,
-    min_ascii_ratio: float,
-    min_keyword_hits: int,
-    user_keywords: List[str]
-) -> List[str]:
+def looks_like_prompt(text: str, min_len: int, require_english: bool, strict_lang: bool, keywords: List[str], min_keyword_hits: int) -> bool:
+    # Điều kiện độ dài tối thiểu
+    if len(text) < min_len:
+        return False
+    # Chỉ giữ tiếng Anh
+    if require_english and not is_english(text, strict_lang):
+        return False
+    # (tùy chọn) yêu cầu khớp một số keyword cấu trúc prompt
+    if min_keyword_hits > 0 and keywords:
+        hits = sum(1 for k in keywords if k and k.lower() in text.lower())
+        if hits < min_keyword_hits:
+            return False
+    return True
+
+def filter_prompts(paragraphs: List[str], min_len: int, require_english: bool, strict_lang: bool, keywords: List[str], min_keyword_hits: int) -> List[str]:
     prompts = [
         p for p in paragraphs
-        if looks_like_prompt(p, min_len, min_ascii_ratio, min_keyword_hits, user_keywords)
+        if looks_like_prompt(p, min_len, require_english, strict_lang, keywords, min_keyword_hits)
     ]
-    # Fallback nhẹ nếu không bắt được gì
-    if len(prompts) == 0:
-        prompts = [
-            p for p in paragraphs
-            if len(p) >= max(600, min_len) and ascii_ratio(p) >= max(0.7, min_ascii_ratio - 0.1)
-        ]
+    # Không có fallback nới lỏng độ dài: yêu cầu người dùng > = 1000 ký tự
     return prompts
 
-# ---------- UI ----------
-st.title("📝 DOCX → Prompts TXT")
-st.caption("Tải file Word (.docx) có kịch bản/prompt, app sẽ lọc và xuất TXT chỉ chứa các prompt.")
+# ----------------- UI -----------------
+st.title("DOCX → English Prompts TXT")
+st.caption("Tải .docx, lọc **chỉ các prompt tiếng Anh** và **bỏ đoạn < 1000 ký tự**.")
 
 with st.sidebar:
-    st.header("Bộ lọc (tùy chỉnh)")
-    min_len = st.slider("Độ dài tối thiểu của 1 prompt (ký tự)", 100, 3000, 500, 50)
-    min_ascii = st.slider("Tỷ lệ ASCII tối thiểu", 0.0, 1.0, 0.75, 0.01)
-    min_hits = st.slider("Số lượng keyword tối thiểu khớp", 0, 10, 2, 1)
-    kw_input = st.text_area(
-        "Keywords (phân tách bằng dấu phẩy)",
-        value=", ".join(DEFAULT_KEYWORDS),
-        height=100
-    )
+    st.header("Thiết lập lọc")
+    min_len = st.slider("Độ dài tối thiểu (ký tự)", min_value=1000, max_value=4000, value=1000, step=100)
+    require_english = st.checkbox("Chỉ giữ prompt tiếng Anh", value=True)
+    strict_lang = st.checkbox("Dò tiếng Anh nghiêm ngặt (langdetect)", value=False,
+                              help="Cần gói langdetect. Nếu chưa cài, app tự dùng heuristic nhanh.")
+    min_hits = st.slider("Số keyword cấu trúc tối thiểu", 0, 10, 2, 1)
+    kw_input = st.text_area("Keywords (phân tách dấu phẩy)", value=", ".join(DEFAULT_KEYWORDS), height=90)
     user_keywords = [k.strip() for k in kw_input.split(",") if k.strip()]
     st.markdown("---")
-    st.caption("Gợi ý: Nếu prompt của bạn luôn có các lớp như 'objective, environment, camera, lighting, VFX, transition, CTA…', hãy giữ từ khóa này để lọc chính xác.")
+    if require_english and strict_lang and not LANGDETECT_AVAILABLE:
+        st.warning("langdetect chưa sẵn có. Vui lòng cài trong requirements hoặc tắt chế độ nghiêm ngặt.")
 
 uploaded = st.file_uploader("Chọn file .docx", type=["docx"])
 
 if uploaded is not None:
     try:
-        paragraphs = extract_paragraphs_from_docx(uploaded.read())
-        st.success(f"Đã đọc {len(paragraphs)} đoạn văn từ tài liệu.")
-        prompts = filter_prompts(paragraphs, min_len, min_ascii, min_hits, user_keywords)
+        file_bytes = uploaded.read()
+        paragraphs = extract_paragraphs_from_docx(file_bytes)
+        st.success(f"Đọc được {len(paragraphs)} đoạn.")
 
-        st.subheader(f"Kết quả: {len(prompts)} prompt")
+        prompts = filter_prompts(
+            paragraphs=paragraphs,
+            min_len=min_len,
+            require_english=require_english,
+            strict_lang=strict_lang,
+            keywords=user_keywords,
+            min_keyword_hits=min_hits
+        )
+
+        st.subheader(f"Kết quả: {len(prompts)} prompt (English-only, ≥ {min_len} ký tự)")
         if len(prompts) == 0:
-            st.warning("Không phát hiện prompt theo tiêu chí hiện tại. Vui lòng nới tiêu chí lọc trong sidebar.")
+            st.warning("Không có prompt nào thỏa điều kiện. Hãy kiểm tra lại đầu vào hoặc nới tiêu chí keyword.")
         else:
-            # Xem nhanh 3 prompt đầu
-            with st.expander("Xem nhanh (tối đa 3 prompt đầu)"):
+            # Xem nhanh
+            with st.expander("Xem nhanh 3 prompt đầu"):
                 for i, pr in enumerate(prompts[:3], 1):
                     st.markdown(f"**Prompt #{i}**")
                     st.write(pr)
 
-            # Xuất TXT
-            sep = "\n\n"
-            txt_content = sep.join(p.strip() for p in prompts)
-            file_name_stem = uploaded.name.rsplit(".", 1)[0]
-            out_name = f"{file_name_stem}_prompts_only.txt"
-            st.download_button(
-                label="⬇️ Tải TXT chứa prompts",
-                data=txt_content.encode("utf-8"),
-                file_name=out_name,
-                mime="text/plain"
-            )
-
-            # Tuỳ chọn dọn nhiễu (optional)
-            st.markdown("---")
-            st.subheader("Tùy chọn làm sạch thêm (Optional)")
-            rm_numbers = st.checkbox("Loại bỏ số heading/prefix dạng 'Scene 01:', 'Video 12 – ' ở đầu dòng")
-            rm_quotes = st.checkbox("Loại bỏ ngoặc kép đầu/cuối toàn prompt")
-            if st.button("Áp dụng làm sạch & tạo lại TXT"):
-                cleaned = []
-                for pr in prompts:
-                    s = pr
-                    if rm_numbers:
-                        s = re.sub(r"^\s*(scene|video)\s*[:\-#]?\s*\d+\s*[\-\–:]\s*", "", s, flags=re.I)
-                    if rm_quotes:
-                        s = s.strip()
-                        s = re.sub(r'^["“”]+', '', s)
-                        s = re.sub(r'["“”]+$', '', s)
-                    cleaned.append(s.strip())
-                txt_content2 = "\n\n".join(cleaned)
-                st.download_button(
-                    label="⬇️ Tải TXT đã làm sạch",
-                    data=txt_content2.encode("utf-8"),
-                    file_name=f"{file_name_stem}_prompts_only_clean.txt",
-                    mime="text/plain",
-                    key="clean_download"
-                )
+            txt_content = "\n\n".join(p.strip() for p in prompts)
+            base = uploaded.name.rsplit(".", 1)[0]
+            out_name = f"{base}_EN_prompts_min{min_len}.txt"
+            st.download_button("Tải TXT", data=txt_content.encode("utf-8"), file_name=out_name, mime="text/plain")
 
     except Exception as e:
         st.error(f"Lỗi xử lý: {e}")
